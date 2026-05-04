@@ -11,6 +11,7 @@ import random
 import logging
 import threading
 import subprocess
+import concurrent.futures
 
 from TP_lib import epd2in13_V4, gt1151
 import chess
@@ -60,12 +61,15 @@ def _move_label(board: chess.Board) -> str:
 _last_display_buf = None
 
 
+_SF_PROBE_TIMEOUT = 8  # seconds — slightly above the 5 s subprocess timeout in get_sf_info
+
+
 class _TestHooks:
     """Test-seam wired up by integration tests; ignored in production runs."""
 
     def __init__(self):
         self.on_transition = None  # callable() – after every full-refresh transition
-        self.on_startup    = None  # callable() – once after initial splash is ready
+        self.on_startup    = None  # callable() – once splash is fully interactive (buttons visible)
         self.stop          = False # True → exit the main loop on the next iteration
 
 
@@ -158,13 +162,11 @@ def main():
     log.info('ZeroFish v%s starting', config.VERSION)
 
     # Probe Stockfish in the background so the splash appears immediately.
-    sf_info        = None
-    _sf_result     = [None]
-    def _probe_sf():
-        _sf_result[0] = get_sf_info()
-        log.info('Engine: %s  %s', *_sf_result[0])
-    sf_thread = threading.Thread(target=_probe_sf, daemon=True)
-    sf_thread.start()
+    sf_info      = None
+    _sf_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    _sf_future   = _sf_executor.submit(get_sf_info)
+    _sf_executor.shutdown(wait=False)
+    _sf_started  = time.time()
 
     saves_list = game_state.list_saves()
     log.info('Unfinished saves: %d', len(saves_list))
@@ -226,13 +228,21 @@ def main():
             if _test_hooks.stop:
                 break
 
-            # Once the SF probe finishes, update the splash with engine info and show buttons.
-            if machine.is_at(ui.SCREEN_SPLASH) and sf_info is None and not sf_thread.is_alive():
-                sf_info = _sf_result[0] or ('Stockfish', '')
-                _show(epd, build_splash_screen(sf_info, has_resume=(len(saves_list) > 0)),
-                      partial_count)
-                if _test_hooks.on_startup is not None:
-                    _test_hooks.on_startup()
+            # Once the SF probe finishes (or times out), update splash and enable buttons.
+            if machine.is_at(ui.SCREEN_SPLASH) and sf_info is None:
+                probe_done    = _sf_future.done()
+                probe_timeout = not probe_done and (time.time() - _sf_started > _SF_PROBE_TIMEOUT)
+                if probe_done or probe_timeout:
+                    if probe_done:
+                        sf_info = _sf_future.result()
+                        log.info('Engine: %s  %s', *sf_info)
+                    else:
+                        sf_info = ('Stockfish', 'unavailable')
+                        log.warning('SF probe timed out after %ds', _SF_PROBE_TIMEOUT)
+                    _show(epd, build_splash_screen(sf_info, has_resume=(len(saves_list) > 0)),
+                          partial_count)
+                    if _test_hooks.on_startup is not None:
+                        _test_hooks.on_startup()
 
             had_irq = (dev.Touch == 1)
             gt.GT_Scan(dev, old)
